@@ -7,11 +7,23 @@ from typing import cast
 
 from installer.destinations import WheelDestination
 from installer.exceptions import InvalidWheelSource
+from installer.policies import (
+    PTH_IMPORT,
+    PTH_PATH,
+    EntryCategory,
+    LaunchEntry,
+    LaunchEntryPolicy,
+    classify_pth_line,
+    is_pth_launch_file,
+)
 from installer.records import RecordEntry
 from installer.sources import WheelSource
 from installer.utils import SCHEME_NAMES, Scheme, parse_entrypoints, parse_metadata_file
 
 __all__ = ["install"]
+
+# Schemes that correspond to site directories scanned by the ``site`` module.
+_SITE_SCHEMES = (Scheme("purelib"), Scheme("platlib"))
 
 
 def _process_WHEEL_file(source: WheelSource) -> Scheme:  # noqa: N802
@@ -62,10 +74,160 @@ def _determine_scheme(
     return cast("Scheme", scheme_name), posixpath.join(*reversed(parts[:-1]))
 
 
+def _archive_label(source: WheelSource) -> str:
+    """Stable identifier of the archive, for policy violation reports."""
+    zipfile = getattr(source, "_zipfile", None)
+    filename = getattr(zipfile, "filename", None)
+    if isinstance(filename, str):
+        return posixpath.basename(filename)
+    return f"{source.distribution}-{source.version}"
+
+
+def _normalize_destination_path(path: str) -> str:
+    """Normalize a POSIX destination path for classification.
+
+    This collapses redundant separators and ``..`` segments so that a wheel
+    cannot make an entry appear outside of the site directory (or hide its
+    ``.pth`` suffix) through path tricks.
+    """
+    return posixpath.normpath(path)
+
+
+def _pth_entries(
+    *,
+    archive_label: str,
+    scheme: Scheme,
+    source_path: str,
+    destination_path: str,
+    content: bytes,
+) -> list[LaunchEntry]:
+    """Classify the launch entries inside one ``.pth`` file."""
+    text = content.decode("utf-8-sig", errors="replace")
+
+    line_numbers: dict[str, list[int]] = {PTH_IMPORT: [], PTH_PATH: []}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        kind = classify_pth_line(line)
+        if kind in line_numbers:
+            line_numbers[kind].append(line_number)
+
+    entries = []
+    name = posixpath.basename(destination_path)
+    for kind, category in (
+        (PTH_IMPORT, EntryCategory.PTH_IMPORT),
+        (PTH_PATH, EntryCategory.PTH_PATH),
+    ):
+        if line_numbers[kind]:
+            entries.append(
+                LaunchEntry(
+                    category=category,
+                    archive=archive_label,
+                    source_path=source_path,
+                    scheme=scheme,
+                    destination_path=destination_path,
+                    name=name,
+                    line_numbers=tuple(line_numbers[kind]),
+                )
+            )
+    return entries
+
+
+def _collect_launch_entries(
+    source: WheelSource,
+    root_scheme: Scheme,
+    additional_metadata: dict[str, bytes],
+) -> list[LaunchEntry]:
+    """Enumerate every launch entry, using final post-relocation destinations.
+
+    No file is written while this runs; wheel contents are only read for
+    classification. Every code-execution or ``sys.path`` entry described by
+    the wheel -- including those hidden behind ``.data`` relocation,
+    additional metadata or case/path tricks -- is represented here so that
+    the policy can reject them before installation starts.
+    """
+    archive_label = _archive_label(source)
+    entries: list[LaunchEntry] = []
+
+    # Launchers generated from entry_points.txt.
+    if "entry_points.txt" in source.dist_info_filenames:
+        entrypoints_text = source.read_dist_info("entry_points.txt")
+        for name, module, attr, _section in parse_entrypoints(entrypoints_text):
+            entries.append(
+                LaunchEntry(
+                    category=EntryCategory.ENTRY_POINT,
+                    archive=archive_label,
+                    source_path=posixpath.join(
+                        source.dist_info_dir, "entry_points.txt"
+                    ),
+                    scheme=Scheme("scripts"),
+                    destination_path=name,
+                    name=name,
+                    module=f"{module}:{attr}",
+                )
+            )
+
+    # Files shipped inside the wheel archive.
+    for record_elements, stream, _is_executable in source.get_contents():
+        source_record = RecordEntry.from_elements(*record_elements)
+        source_path = source_record.path
+        if source_path == posixpath.join(source.dist_info_dir, "RECORD"):
+            continue
+        if "__pycache__" in source_path.split("/")[:-1]:
+            continue
+
+        scheme, raw_destination_path = _determine_scheme(
+            path=source_path,
+            source=source,
+            root_scheme=root_scheme,
+        )
+        destination_path = _normalize_destination_path(raw_destination_path)
+
+        if scheme == Scheme("scripts"):
+            entries.append(
+                LaunchEntry(
+                    category=EntryCategory.SCRIPT,
+                    archive=archive_label,
+                    source_path=source_path,
+                    scheme=scheme,
+                    destination_path=destination_path,
+                    name=posixpath.basename(destination_path),
+                )
+            )
+        elif scheme in _SITE_SCHEMES and is_pth_launch_file(destination_path):
+            entries.extend(
+                _pth_entries(
+                    archive_label=archive_label,
+                    scheme=scheme,
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    content=stream.read(),
+                )
+            )
+
+    # Additional metadata written by the caller is subject to the same rules,
+    # so an entry cannot bypass the policy by being generated at install time.
+    for filename, content in additional_metadata.items():
+        source_path = posixpath.join(source.dist_info_dir, filename)
+        destination_path = _normalize_destination_path(filename)
+        if root_scheme in _SITE_SCHEMES and is_pth_launch_file(destination_path):
+            entries.extend(
+                _pth_entries(
+                    archive_label=archive_label,
+                    scheme=root_scheme,
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    content=content,
+                )
+            )
+
+    return entries
+
+
 def install(
     source: WheelSource,
     destination: WheelDestination,
     additional_metadata: dict[str, bytes],
+    *,
+    launch_entry_policy: LaunchEntryPolicy | None = None,
 ) -> None:
     """Install wheel described by ``source`` into ``destination``.
 
@@ -73,9 +235,19 @@ def install(
     :param destination: where to write the wheel.
     :param additional_metadata: additional metadata files to generate, usually
                                 generated by the caller.
+    :param launch_entry_policy: optional policy reviewed against every launch
+                                entry (``.pth`` files, bundled scripts and
+                                entry-point launchers) before any file is
+                                written. When :data:`None`, installation keeps
+                                its historical, policy-free behaviour.
 
     """
     root_scheme = _process_WHEEL_file(source)
+
+    # Review all launch entries first; a denial must never leave files behind.
+    if launch_entry_policy is not None:
+        entries = _collect_launch_entries(source, root_scheme, additional_metadata)
+        launch_entry_policy.evaluate(entries)
 
     # RECORD handling
     record_file_path = posixpath.join(source.dist_info_dir, "RECORD")

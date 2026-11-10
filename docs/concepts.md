@@ -36,3 +36,17 @@ implementations to be more powerful and flexible.
 Most of these tasks can either be delegated to utilities provided in this
 library (eg: script generation), or to the Python standard library (eg:
 generating `.pyc` files).
+
+## Launch entry policies
+
+Some wheels install mechanisms that run code or change `sys.path` without an
+explicit `import` of the package: executable or path lines in `.pth` files,
+executables in the `scripts` scheme and launchers generated from
+`entry_points.txt`. {mod}`installer.policies` provides an optional policy that
+classifies these launch entries using the target interpreter's actual
+{mod}`site` semantics and allows or denies them before the installation
+writes anything.
+
+This review is deliberately narrow: it covers launch entries only. Allowing a
+wheel through the policy is not a statement that the package's ordinary code
+is safe.

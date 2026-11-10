@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import installer
 from installer.destinations import SchemeDictionaryDestination
+from installer.policies import load_launch_entry_policy
 from installer.sources import WheelFile
 from installer.utils import get_launcher_kind
 
@@ -56,6 +57,17 @@ def _get_main_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="silently overwrite existing files",
     )
+    parser.add_argument(
+        "--launch-entry-policy",
+        metavar="path",
+        type=str,
+        default=None,
+        help=(
+            "JSON policy file reviewed against launch entries (.pth files, "
+            "bundled scripts and entry-point scripts) before anything is "
+            "written"
+        ),
+    )
     return parser
 
 
@@ -96,6 +108,12 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
     elif not bytecode_levels:
         bytecode_levels = [0, 1]
 
+    launch_entry_policy = (
+        load_launch_entry_policy(args.launch_entry_policy)
+        if args.launch_entry_policy is not None
+        else None
+    )
+
     for wheel in args.wheel:
         with WheelFile.open(wheel) as source:
             if args.validate_record != "none":
@@ -108,7 +126,12 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
                 destdir=args.destdir,
                 overwrite_existing=args.overwrite_existing,
             )
-            installer.install(source, destination, {})
+            installer.install(
+                source,
+                destination,
+                {},
+                launch_entry_policy=launch_entry_policy,
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

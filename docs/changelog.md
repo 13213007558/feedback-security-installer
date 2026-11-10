@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- Add an optional launch entry policy (`installer.policies`, and the
+  `--launch-entry-policy` CLI option) that reviews `.pth` files, bundled
+  scripts and `entry_points.txt` launchers before any file is written.
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)

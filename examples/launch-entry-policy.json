@@ -1,0 +1,11 @@
+{
+  "default_action": "deny",
+  "rules": [
+    {
+      "action": "allow",
+      "categories": ["entry_point"],
+      "names": ["fancy", "fancy-gui"],
+      "modules": ["fancy:main"]
+    }
+  ]
+}
