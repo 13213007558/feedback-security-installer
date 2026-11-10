@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     ScriptSection = Literal["console", "gui"]
 
 
-__all__ = ["InvalidScript", "Script"]
+__all__ = ["InvalidScript", "Script", "get_script_name"]
 
 
 _ALLOWED_LAUNCHERS: Mapping[tuple["ScriptSection", "LauncherKind"], str] = {
@@ -39,6 +39,18 @@ if __name__ == "__main__":
     sys.argv[0] = sys.argv[0].removesuffix(".exe")
     sys.exit({func_path}())
 """
+
+
+def get_script_name(name: str, kind: "LauncherKind") -> str:
+    """Get the on-disk name of a generated entry-point launcher.
+
+    :param name: entry point name, as declared in ``entry_points.txt``.
+    :param kind: launcher kind used for generation (determines the platform).
+    :return: the filename the launcher is written as, with ``.exe`` on Windows.
+    """
+    if kind == "posix":
+        return name
+    return f"{name}.exe"
 
 
 class InvalidScript(ValueError):
@@ -113,7 +125,7 @@ class Script:
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w") as zf:
             zf.writestr("__main__.py", code)
-        name = f"{self.name}.exe"
+        name = get_script_name(self.name, kind)
         data = launcher + shebang + b"\n" + stream.getvalue()
         return name, data
 

@@ -1,5 +1,24 @@
 # Changelog
 
+## unreleased
+
+- Add an installation planning phase (`installer.plan`): every output path is
+  now computed and validated before the first file is written. The plan covers
+  archive members (including `.data` relocations), generated entry-point
+  scripts, additional dist-info metadata and the final `RECORD`.
+- Detect two outputs landing on the same file, file/directory conflicts and
+  case-only aliases on case-insensitive (Windows) targets, based on the
+  actual `scheme_dict` and `destdir` rather than archive member names.
+- Reject path traversal (`PathTraversalError`) and symbolic links inside the
+  trusted installation root (`ExistingLinkError`). Pre-existing regular files
+  remain overridable through `overwrite_existing`; links are never followed.
+- Bind each plan to the wheel identity and a destination fingerprint, so plans
+  cannot be reused against another source or scheme configuration
+  (`StalePlanError`).
+- `install` now returns the validated `InstallationPlan` for
+  `SchemeDictionaryDestination` and accepts a pre-built plan via the `plan`
+  argument. Custom `WheelDestination` subclasses keep the previous behaviour.
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)

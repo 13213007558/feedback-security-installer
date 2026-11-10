@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     BinaryIO,
+    ClassVar,
     Union,
 )
 
@@ -26,12 +27,78 @@ if TYPE_CHECKING:
     from installer.scripts import LauncherKind, ScriptSection
 
 
+@dataclass(frozen=True)
+class ResolvedTarget:
+    """The fully resolved location of a single file to be installed.
+
+    The object describes where bytes will be written *and* how that location
+    relates to the trusted installation root, without performing any write or
+    following any symbolic link.
+
+    :param scheme: scheme the file belongs to.
+    :param path: scheme-relative logical path, using POSIX separators.
+    :param write_path: absolute path the bytes are actually written to, with
+        ``destdir`` staging applied but without resolving symbolic links.
+    :param install_root: canonical (``realpath``) trusted root that contains
+        the file. With ``destdir`` this is the staging directory, otherwise the
+        scheme directory.
+    :param relative_path: lexical path of the file within ``install_root``.
+        Symbolic links inside the root are deliberately *not* resolved here.
+    :param case_sensitive: whether two names differing only in case denote
+        distinct files at this target.
+    """
+
+    scheme: Scheme
+    path: str
+    write_path: Path
+    install_root: Path
+    relative_path: Path
+    case_sensitive: bool
+
+    @property
+    def lexical_path(self) -> Path:
+        """Absolute path with only the trusted root itself canonicalised."""
+        return self.install_root / self.relative_path
+
+    def case_key(self) -> tuple[str, ...]:
+        """Key that collapses names that are aliases on this target."""
+        parts = (str(self.install_root), *self.relative_path.parts)
+        if self.case_sensitive:
+            return tuple(parts)
+        return tuple(part.lower() for part in parts)
+
+
 class WheelDestination:
     """Handles writing the unpacked files, script generation and ``RECORD`` generation.
 
     Subclasses provide the concrete script generation logic, as well as the RECORD file
     (re)writing.
     """
+
+    supports_installation_planning: ClassVar[bool] = False
+    """Whether this destination can resolve and validate targets before writing."""
+
+    def resolve_target(self, scheme: Scheme, path: str) -> ResolvedTarget:
+        """Resolve a scheme-relative path to a concrete, write-independent target.
+
+        :param scheme: scheme the file belongs to (like "purelib", "scripts").
+        :param path: path within that scheme.
+        :raises installer.exceptions.PathTraversalError: if ``path`` escapes
+            the scheme's target directory after normalisation.
+        """
+        raise NotImplementedError
+
+    def is_case_sensitive(self) -> bool:
+        """Whether two paths differing only in case are distinct files here."""
+        raise NotImplementedError
+
+    def planning_fingerprint(self) -> tuple[object, ...]:
+        """Return a stable fingerprint of the destination's path configuration.
+
+        A plan is only valid for a destination whose fingerprint matches the
+        one it was built with.
+        """
+        raise NotImplementedError
 
     def write_script(
         self, name: str, module: str, attr: str, section: "ScriptSection"
@@ -102,6 +169,8 @@ class WheelDestination:
 class SchemeDictionaryDestination(WheelDestination):
     """Destination, based on a mapping of {scheme: file-system-path}."""
 
+    supports_installation_planning: ClassVar[bool] = True
+
     scheme_dict: dict[str, str]
     """A mapping of {scheme: file-system-path}"""
 
@@ -135,7 +204,51 @@ class SchemeDictionaryDestination(WheelDestination):
     overwrite_existing: bool = False
     """Silently overwrite existing files."""
 
-    def _path_with_destdir(self, scheme: Scheme, path: str) -> Path:
+    def is_case_sensitive(self) -> bool:
+        """Whether target file names are case-sensitive.
+
+        Case rules follow the target platform implied by ``script_kind``:
+        Windows targets are case-insensitive (with case-preserving file
+        systems), while POSIX targets are case-sensitive.
+        """
+        return self.script_kind == "posix"
+
+    def planning_fingerprint(self) -> tuple[object, ...]:
+        """Fingerprint of the scheme directories and staging configuration."""
+        return (
+            tuple(
+                sorted(
+                    (
+                        scheme,
+                        os.path.abspath(path),  # noqa: PTH100
+                        os.path.realpath(path),  # noqa: PTH100
+                    )
+                    for scheme, path in self.scheme_dict.items()
+                )
+            ),
+            None
+            if self.destdir is None
+            else (
+                os.path.abspath(self.destdir),  # noqa: PTH100
+                os.path.realpath(self.destdir),  # noqa: PTH100
+            ),
+            self.is_case_sensitive(),
+        )
+
+    def _install_root(self, scheme: Scheme) -> Path:
+        if self.destdir is not None:
+            # All staged writes share the destdir as their trusted root.
+            return Path(os.path.realpath(self.destdir))  # noqa: PTH100
+        return Path(os.path.realpath(self.scheme_dict[scheme]))  # noqa: PTH100
+
+    def resolve_target(self, scheme: Scheme, path: str) -> ResolvedTarget:
+        """Resolve ``path`` within ``scheme``, applying destdir and case rules.
+
+        The scheme directory itself (and the ``destdir`` staging root, if any)
+        is canonicalised with ``realpath``; components inside that trusted root
+        are kept lexical, so symbolic links there remain visible to the
+        planning checks instead of being silently followed.
+        """
         # See https://docs.python.org/3/library/zipfile.html#zipfile.Path:
         #  When handling untrusted archives,
         #  consider resolving filenames using os.path.abspath()
@@ -146,18 +259,49 @@ class SchemeDictionaryDestination(WheelDestination):
         #
         # We want to avoid Path.resolve() because it is significantly slower
         # than os.path.abspath()!
-        target_dir = Path(os.path.abspath(self.scheme_dict[scheme]))  # noqa: PTH100
-        file = Path(os.path.abspath(target_dir / path))  # noqa: PTH100
+        lexical_scheme_root = Path(
+            os.path.abspath(self.scheme_dict[scheme])  # noqa: PTH100
+        )
+        file = Path(os.path.abspath(lexical_scheme_root / path))  # noqa: PTH100
 
-        if not file.is_relative_to(target_dir):
-            raise ValueError(
+        if not file.is_relative_to(lexical_scheme_root):
+            from installer.exceptions import PathTraversalError
+
+            raise PathTraversalError(
                 f"Attempting to write {path} outside of the target directory"
             )
 
         if self.destdir is not None:
-            rel_path = file.relative_to(file.anchor)
-            return Path(self.destdir) / rel_path
-        return file
+            # Drop the mount anchor ("/" on POSIX, "C:\\" on Windows) so the
+            # staged path is relative to the destdir root and symlink checks
+            # walk the components actually created inside it.
+            rel_path = Path(*file.relative_to(file.anchor).parts)
+            write_path = Path(self.destdir) / rel_path
+        else:
+            write_path = file
+
+        install_root = self._install_root(scheme)
+        # Relative to the lexical root when it differs from the canonical one
+        # (e.g. the trusted scheme directory is itself reached via a symlink);
+        # symlinks *below* the root are still lexical and get checked.
+        lexical_root = (
+            Path(os.path.abspath(self.destdir))  # noqa: PTH100
+            if self.destdir is not None
+            else lexical_scheme_root
+        )
+        relative_path = write_path.relative_to(lexical_root)
+
+        return ResolvedTarget(
+            scheme=scheme,
+            path=path,
+            write_path=write_path,
+            install_root=install_root,
+            relative_path=relative_path,
+            case_sensitive=self.is_case_sensitive(),
+        )
+
+    def _path_with_destdir(self, scheme: Scheme, path: str) -> Path:
+        return self.resolve_target(scheme, path).write_path
 
     def write_to_fs(
         self,
