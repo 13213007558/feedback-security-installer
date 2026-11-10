@@ -5,11 +5,16 @@ import os.path
 import sys
 import sysconfig
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import installer
 from installer.destinations import SchemeDictionaryDestination
 from installer.sources import WheelFile
 from installer.utils import get_launcher_kind
+from installer.verified import VerifiedWheelSource
+
+if TYPE_CHECKING:
+    from installer.sources import WheelSource
 
 
 def _get_main_parser() -> argparse.ArgumentParser:
@@ -98,8 +103,16 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
 
     for wheel in args.wheel:
         with WheelFile.open(wheel) as source:
-            if args.validate_record != "none":
-                source.validate_record(validate_contents=args.validate_record == "all")
+            if args.validate_record == "all":
+                # Bind the installation to a source whose contents are proven
+                # to match RECORD, so the installed bytes are exactly the
+                # verified ones.
+                install_source: WheelSource = VerifiedWheelSource(source)
+            elif args.validate_record == "entries":
+                source.validate_record(validate_contents=False)
+                install_source = source
+            else:
+                install_source = source
             destination = SchemeDictionaryDestination(
                 scheme_dict=_get_scheme_dict(source.distribution, prefix=args.prefix),
                 interpreter=sys.executable,
@@ -108,7 +121,7 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
                 destdir=args.destdir,
                 overwrite_existing=args.overwrite_existing,
             )
-            installer.install(source, destination, {})
+            installer.install(install_source, destination, {})
 
 
 if __name__ == "__main__":  # pragma: no cover

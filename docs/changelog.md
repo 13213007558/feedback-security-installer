@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- Add `VerifiedWheelSource`, which validates a wheel's `RECORD` against its
+  archive members (one-to-one membership, sizes and digests) and binds
+  installation to streams that re-verify the bytes while reading, so contents
+  changed after validation cannot be installed
+- Use `VerifiedWheelSource` for the CLI's `--validate-record all` mode
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)
